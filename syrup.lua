@@ -137,9 +137,9 @@ function srp.certAuthInit(path) -- iniatilise certificate authority
 	local certPublicKey = certKeyPair[2]
 
 	print("Keypair gathered from keyfile")
-	if fs.exists(path) then
-		print("Found "..path)
-		local certRead = fs.open(path, "r")
+	if fs.exists(path.."/server.cert") then
+		print("Found "..path.."/server.cert")
+		local certRead = fs.open(path.."/server.cert", "r")
 
 		local unsignedServer = textutils.unserialize(certRead.readAll())
 		print(unsignedServer)
@@ -150,12 +150,18 @@ function srp.certAuthInit(path) -- iniatilise certificate authority
 		signedServer["unsignedCert"] = unsignedServer
 		signedServer["signature"] = signature
 		signedServer["certAuthPublic"] = tostring(certPublicKey)
+		print(textutils.serialize())
 
-		certWrite = fs.open(path, "w")
-		certWrite.write(textutils.serialize(unsignedServer))
+		certWrite = fs.open(path.."/server.cert", "w")
+		certWrite.write(textutils.serialize(signedServer))
 		certWrite.close()
+
+		certWrite = fs.open(path.."/certPublic.key", "w")
+		certWrite.write(certPublicKey)
+
+		print("Success!")
 	else
-		error("path"..existenceError)
+		error(path.."/server.cert"..existenceError)
 	end
 end
 -- unsigned server cert format:
@@ -172,11 +178,39 @@ end
 --  certAuthPublic: string
 -- }
 
+function srp.uuid()
+	local random = math.random
+    local template ='xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'
+    return string.gsub(template, '[xy]', function (c)
+        return string.format('%x', c == 'x' and random(0, 0xf) or random(8, 0xb))
+    end)
+end
+
+function srp.payloadLegitimacy(payload, uuidTable)
+	payload = textutils.unserialize(payload)
+	if os.time() - payload["time"] > 3 then
+		return false
+	end
+
+	if #uuidTable == 0 then
+		table.insert(uuidTable, payload["uuid"])
+		return true
+	else
+		for k, v in pairs(uuidTable) do
+			if  payload["uuid"] == v then
+				return false
+			else
+				table.insert(uuidTable, payload["uuid"])
+				return true
+			end
+		end
+	end
+end
 
 function srp.nameToAddress(name)
 	assert(type(name) == "string", "name"..conformityError)
 
-	local hashedName = sha.digest(name)
+	local hashedName = textutils.serialize(sha.digest(name))
 
 	local nameTable = {}
 	local address = 0
@@ -236,7 +270,7 @@ function srp.host(name, secure, certPath, keyPath)
 		serverPublicKey = keyPair[2]
 	end
 
-	if certPath == nil then -- if a certificate has not been provided, generate one
+	if certPath == nil then
 		print("No certificate has been provided, generating one")
 		local writeHandle = fs.open("server/server.cert", "w")
 
@@ -247,12 +281,14 @@ function srp.host(name, secure, certPath, keyPath)
 		writeHandle.close()
 	elseif not fs.exists(certPath) then
 		error("certPath"..existenceError)
-	else
-		local readHandle = fs.open(certPath, "r")
+	elseif fs.exists("server/server.cert") then
+		local readHandle = fs.open("server/server.cert", "r")
+		certificate = readHandle.readAll()
 
-		certificate = textutils.unserialize(readHandle.readAll())
+		certificate = textutils.unserialize(certificate)
 		readHandle.close()
 	end
+
 	if certificate["signature"] == nil then
 		term.setTextColor(colors.red)
 		term.write("!WARNING! ")
@@ -290,49 +326,68 @@ function srp.resolveConnections(address, secure, certPath)
 	assert(type(secure) == "boolean" or secure == nil, "secure"..conformityError)
 	assert(fs.exists(certPath), "certPath"..conformityError..". Has it been generated?")
 
-	if not modem then
-		local modem = peripheral.find("modem")
-		if not modem then error("No modem attached", 2) end
-	end
+	local uuidReceive = {}
+
+	local modem = peripheral.find("modem")
+	if not modem then error("No modem attached", 2) end
+
 
 	if not modem.isOpen(address) then modem.open(address) end
 	while true do
 		local event, side, freq, replyFreq, msg = os.pullEvent("modem_message")
-		if msg == "connection_request" then
+		if textutils.unserialize(msg)["ident"] == "connection_request" and srp.payloadLegitimacy(msg, uuidReceive) then
+
 			local readHandle = fs.open(certPath, "r")
-			local certificate = readHandle.readAll()
+			local certificate = textutils.unserialize(readHandle.readAll())
+			
 			local payloadTable = {}
 			payloadTable["secure"] = secure
+			payloadTable["time"] = os.time()
+			payloadTable["uuid"] = srp.uuid()
 			payloadTable["cert"] = certificate
 			local handshakePayload = textutils.serialize(payloadTable)
 			readHandle.close()
 			modem.transmit(replyFreq, freq, handshakePayload)
+		elseif textutils.unserialize(msg)["user"] ~= nil then
+			print(textutils.unserialize(msg)["user"])
+			print(textutils.unserialize(msg)["hashPass"])
 		end
 	end
 end
 
-function srp.connect(name, user, hashPass)
+function srp.connect(name, user, pass)
+
 	assert(type(name) == "string", "name"..conformityError)
 	assert(type(user) == "string" or user == nil, "user"..conformityError)
-	assert(type(hashPass) == "string" or hashPass == nil, "hashPass"..conformityError)
+	assert(type(pass) == "string" or pass == nil, "pass"..conformityError)
+
+	local clientIdempotency = {}
 
 	local address = srp.nameToAddress(name)
 	local modem = peripheral.find("modem")
 	if not modem then error("No modem attached", 2) end
 	modem.open(address)
 
-	modem.transmit(address, address, "connection_request")
+	local connectionRequest = {}
+	connectionRequest["uuid"] = srp.uuid()
+	connectionRequest["time"] = os.time()
+	connectionRequest["ident"] = "connection_request"
+
+	modem.transmit(address, address, textutils.serialize(connectionRequest))
 	while true do
+
 		local event, side, replyFreq, freq, handshakePayload = os.pullEvent("modem_message")
-		if handshakePayload["cert"]["signature"] then -- if signature exists
-			if not ecc.verify(handshakePayload["cert"]["certAuthPublic"], handshakePayload["cert"]["unsignedCert"], handshakePayload["cert"]["signature"]) then
+		if textutils.unserialize(handshakePayload)["cert"]["signature"] and srp.payloadLegitimacy(handshakePayload, clientIdempotency) then -- if signature exists
+			handshakePayload = textutils.unserialize(handshakePayload)
+			local certificate = handshakePayload["cert"]
+			if not ecc.verify(certificate["certAuthPublic"], certificate["unsignedCert"], certificate["signature"]) then
 				return -- certificate forged => terminate transaction
 			end
 			local loginDetails = {}
 			loginDetails["user"] = user
-			loginDetails["hashPass"] = hashPass
-			loginDetails = textutils.serialize(loginDetails)
-			modem.transmit(freq, replyFreq, loginDetails)
+			loginDetails["hashPass"] = sha.digest(pass)
+
+			modem.transmit(freq, replyFreq, textutils.serialize(loginDetails))
 		end
 	end
 end
