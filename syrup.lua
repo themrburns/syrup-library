@@ -186,21 +186,21 @@ function srp.uuid()
     end)
 end
 
-function srp.payloadLegitimacy(payload, uuidTable)
+function srp.payloadLegitimacy(payload, nonceTable)
 	payload = textutils.unserialize(payload)
 	if os.time() - payload["time"] > 3 then
 		return false
 	end
 
-	if #uuidTable == 0 then
-		table.insert(uuidTable, payload["uuid"])
+	if #nonceTable == 0 then
+		table.insert(nonceTable, payload["nonce"])
 		return true
 	else
-		for k, v in pairs(uuidTable) do
-			if  payload["uuid"] == v then
+		for k, v in pairs(nonceTable) do
+			if  payload["nonce"] == v then
 				return false
 			else
-				table.insert(uuidTable, payload["uuid"])
+				table.insert(nonceTable, payload["nonce"])
 				return true
 			end
 		end
@@ -262,8 +262,8 @@ function srp.host(name, secure, certPath, keyPath)
 		writeHandle.close()
 
 	else
-		local readHandle = fs.open("keyPath", "r")
-		keyPair = textutils.unserialize(readHandle.readAll())
+		local readHandle = fs.open(keyPath, "r")
+		local keyPair = textutils.unserialize(readHandle.readAll())
 		readHandle.close()
 
 		serverSecretKey = keyPair[1]
@@ -321,21 +321,41 @@ function srp.host(name, secure, certPath, keyPath)
 	modem.open(address)
 end
 
-function srp.resolveConnections(address, secure, certPath)
+function srp.resolveConnections(address, secure, certPath, keyPath)
 	assert(type(address) == "number", "address"..conformityError)
 	assert(type(secure) == "boolean" or secure == nil, "secure"..conformityError)
 	assert(fs.exists(certPath), "certPath"..conformityError..". Has it been generated?")
+	assert(fs.exists(keyPath), "keyPath"..conformityError..". Has it been generated?")
 
-	local uuidReceive = {}
+	local sharedSecrets = {}
+	local publicKey = {}
+	local nonceReceive = {}
 
 	local modem = peripheral.find("modem")
 	if not modem then error("No modem attached", 2) end
+
+	local readHandle = fs.open(keyPath, "r")
+	local keyPair = textutils.unserialize(readHandle.readAll())
+	readHandle.close()
+
+	local serverSecret = keyPair[1]
+	local serverPublic = keyPair[2]
 
 
 	if not modem.isOpen(address) then modem.open(address) end
 	while true do
 		local event, side, freq, replyFreq, msg = os.pullEvent("modem_message")
-		if textutils.unserialize(msg)["ident"] == "connection_request" and srp.payloadLegitimacy(msg, uuidReceive) then
+		if textutils.unserialize(msg)["ident"] == "connection_request" and srp.payloadLegitimacy(msg, nonceReceive) then
+			msg = textutils.unserialize(msg)
+
+			local userID = msg["userID"]
+			local clientPublic = msg["clientPublic"]
+
+			publicKey[userID] = clientPublic
+
+			local secretShared = ecc.exchange(serverSecret, clientPublic)
+			sharedSecrets[userID] = tostring(secretShared)
+
 
 			local readHandle = fs.open(certPath, "r")
 			local certificate = textutils.unserialize(readHandle.readAll())
@@ -343,14 +363,27 @@ function srp.resolveConnections(address, secure, certPath)
 			local payloadTable = {}
 			payloadTable["secure"] = secure
 			payloadTable["time"] = os.time()
-			payloadTable["uuid"] = srp.uuid()
+			payloadTable["nonce"] = ecc.random.random()
 			payloadTable["cert"] = certificate
 			local handshakePayload = textutils.serialize(payloadTable)
 			readHandle.close()
 			modem.transmit(replyFreq, freq, handshakePayload)
-		elseif textutils.unserialize(msg)["user"] ~= nil then
-			print(textutils.unserialize(msg)["user"])
-			print(textutils.unserialize(msg)["hashPass"])
+		elseif textutils.unserialize(msg)["ident"] == "login_details" and srp.payloadLegitimacy(msg, nonceReceive) then
+			msg = textutils.unserialize(msg)
+
+			if msg["encryptedLoginDetails"] ~= nil then
+				local userUUID = msg["userID"]
+				local userSharedSecret = sharedSecrets[msg["userID"]]
+				cipher = ecc.decrypt(msg["encryptedLoginDetails"], userSharedSecret)
+				if not ecc.verify(publicKey[msg["userID"]], msg["encryptedLoginDetails"], msg["loginSignature"]) then return end
+
+			end
+			local hashPass = tostring(sha.digest(cipher))
+
+			local readHandle = fs.open("server/users.hdb", "r")
+			local userTable = textutils.unserialize(readHandle.readAll())
+
+			print(hashPass)
 		end
 	end
 end
@@ -361,6 +394,8 @@ function srp.connect(name, user, pass)
 	assert(type(user) == "string" or user == nil, "user"..conformityError)
 	assert(type(pass) == "string" or pass == nil, "pass"..conformityError)
 
+	local clientPrivate, clientPublic = ecc.keypair(ecc.random.random())
+
 	local clientIdempotency = {}
 
 	local address = srp.nameToAddress(name)
@@ -368,10 +403,15 @@ function srp.connect(name, user, pass)
 	if not modem then error("No modem attached", 2) end
 	modem.open(address)
 
+	hashName = tostring(sha.digest(user))
+
 	local connectionRequest = {}
-	connectionRequest["uuid"] = srp.uuid()
+	local userUUID = srp.uuid()
+	connectionRequest["nonce"] = ecc.random.random()
 	connectionRequest["time"] = os.time()
+	connectionRequest["clientPublic"] = tostring(clientPublic)
 	connectionRequest["ident"] = "connection_request"
+	connectionRequest["userID"] = userUUID
 
 	modem.transmit(address, address, textutils.serialize(connectionRequest))
 	while true do
@@ -380,14 +420,29 @@ function srp.connect(name, user, pass)
 		if textutils.unserialize(handshakePayload)["cert"]["signature"] and srp.payloadLegitimacy(handshakePayload, clientIdempotency) then -- if signature exists
 			handshakePayload = textutils.unserialize(handshakePayload)
 			local certificate = handshakePayload["cert"]
+			local serverPublic = certificate["unsignedCert"]["serverPublicKey"]
+
+			local ss = ecc.exchange(clientPrivate, serverPublic)
+
 			if not ecc.verify(certificate["certAuthPublic"], certificate["unsignedCert"], certificate["signature"]) then
 				return -- certificate forged => terminate transaction
 			end
-			local loginDetails = {}
-			loginDetails["user"] = user
-			loginDetails["hashPass"] = sha.digest(pass)
+			local loginPayload = {}
+			if handshakePayload["secure"] == true then
+				hashPass = tostring(sha.digest(pass))
 
-			modem.transmit(freq, replyFreq, textutils.serialize(loginDetails))
+				local encryptedLoginDetails = ecc.encrypt(hashPass, tostring(ss))
+				local loginSignature = ecc.sign(clientPrivate, encryptedLoginDetails)
+				loginPayload["encryptedLoginDetails"] = tostring(encryptedLoginDetails)
+				loginPayload["loginSignature"] = loginSignature
+			end
+			loginPayload["user"] = hashName
+			loginPayload["userID"] = userUUID
+			loginPayload["ident"] = "login_details"
+			loginPayload["nonce"] = ecc.random.random()
+			loginPayload["time"] = os.time()
+			print(hashPass)
+			modem.transmit(freq, replyFreq, textutils.serialize(loginPayload))
 		end
 	end
 end
